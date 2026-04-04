@@ -316,3 +316,71 @@
     padding: 18px 16px 16px;
   }
 }
+
+
+/*
+  Append these rules to src/CustomerEntryForm.css
+  ─────────────────────────────────────────────────────────────────────────────
+  Styles for the server warmup indicator and warming error state.
+  Add these at the END of your existing CustomerEntryForm.css file.
+  ─────────────────────────────────────────────────────────────────────────────
+*/
+
+/* ── SERVER WARMUP BADGE ─────────────────────────────────────────────────────
+   Shows in the brand row while Render is waking up
+*/
+.server-warming-badge {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: rgba(245, 158, 11, 0.75);
+  background: rgba(245, 158, 11, 0.10);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  border-radius: 5px;
+  padding: 2px 8px;
+}
+
+/* Animated amber dot for the warming state */
+.server-warming-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(245, 158, 11, 0.85);
+  animation: pulse-warming 1.5s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes pulse-warming {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+
+/* ── SERVER READY BADGE ──────────────────────────────────────────────────────
+   Shows briefly after warmup confirms server is awake
+*/
+.server-ready-badge {
+  display: flex;
+  align-items: center;
+  margin-left: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  color: rgba(20, 184, 166, 0.70);
+}
+
+/* ── WARMING ERROR MESSAGE ───────────────────────────────────────────────────
+   The "Waking up server..." message shown during retries
+   Uses amber instead of red — it is not an error, just a wait
+*/
+.form-error-message--warming {
+  background: rgba(245, 158, 11, 0.08);
+  border-color: rgba(245, 158, 11, 0.25);
+  color: rgba(245, 158, 11, 0.90);
+}
