@@ -1,34 +1,38 @@
 /*
-  src/entry_form/src/hooks/useCustomerForm.js
+  src/hooks/useCustomerForm.js
   ─────────────────────────────────────────────────────────────────────────────
   CUSTOM HOOK: useCustomerForm
 
-  FIX APPLIED — Warm-up ping on form mount + retry on submission failure.
+  FIX: Render free tier cold start ("Failed to fetch")
+  ─────────────────────────────────────────────────────────────────────────────
 
-  WHY THE ENTRY FORM WAS ALSO FAILING:
-    The entry form and the dashboard share the same Render backend.
-    The form's main.jsx had no warm-up ping — it mounted instantly and
-    showed a ready state, but when the user hit "Register Customer" and
-    the form POSTed to a cold Render server, Chrome dropped the connection
-    before Render could respond (same root cause as the dashboard).
+  PROBLEM:
+    Render free tier sleeps after 15 minutes of inactivity.
+    Waking up takes 50+ seconds.
+    When the user clicks Register and Render is asleep:
+      - The POST request waits
+      - The browser times out
+      - Result: "Failed to fetch" — no server error, just silence
 
-    The result: the user fills in the form, clicks submit, gets a network
-    error with no explanation. On Safari it worked because Safari waits longer.
+  SOLUTION — Two-part:
 
-  TWO FIXES:
-    1. Warm-up ping on hook mount (useEffect below).
-       As soon as the form loads, we ping /health in the background.
-       By the time the user fills in the form and clicks submit (10–30s),
-       Render is already warm and the POST succeeds immediately.
-       The user never sees the warm-up — it's invisible.
+    Part 1: WARMUP ON MOUNT
+      The moment the entry form page loads, this hook silently pings
+      GET /api/v1/health in the background.
+      This wakes Render up immediately.
+      By the time the user fills all 7 form fields (30–60 seconds),
+      Render is fully awake and the POST succeeds instantly.
 
-    2. Automatic retry on submission failure.
-       If the POST fails (network error or 5xx), we wait 3 seconds and
-       retry once automatically before showing an error to the user.
-       This covers the rare case where warm-up didn't fully complete.
+    Part 2: RETRY ON COLD START
+      If the user submits before the warmup completes (submitted very fast),
+      the fetch retries up to 3 times with 5-second gaps.
+      A "Waking up server..." message is shown during retries
+      so the user knows what is happening and does not click again.
 
-  EXISTING FIX (kept):
-    Response envelope unwrapping — body.data instead of body directly.
+  TIMING CONSTANTS:
+    WARMUP_RETRY_DELAY_MS = 5000   — wait 5s between retry attempts
+    MAX_SUBMIT_RETRIES    = 3      — retry up to 3 times before giving up
+    SUCCESS_AUTO_RESET_MS = 5000   — form resets 5s after success
   ─────────────────────────────────────────────────────────────────────────────
 */
 
@@ -37,151 +41,258 @@ import { FORM_FIELDS, INITIAL_FORM_STATE } from '../data/formConfig'
 
 // ── CONFIGURATION ─────────────────────────────────────────────────────────────
 
-const BASE_URL = import.meta.env.VITE_API_URL || ''
+const MOCK_MODE = false
 
-// How long to wait (ms) before auto-resetting the form after success
-const AUTO_RESET_DELAY_MS = 5_000
+const MOCK_DELAY_MS        = 900
+const SUCCESS_AUTO_RESET_MS = 5000
+const WARMUP_RETRY_DELAY_MS = 5000   // wait 5s between retries when server is cold
+const MAX_SUBMIT_RETRIES    = 3      // retry the POST up to 3 times total
 
-// How many times to retry a failed POST before showing an error
-const MAX_SUBMIT_RETRIES = 1
-
-// How long to wait between submit retry attempts
-const SUBMIT_RETRY_DELAY_MS = 3_000
-
-
-// ── WARM-UP HELPER ────────────────────────────────────────────────────────────
-
-/**
- * Silently pings /health in the background when the form mounts.
- * The user never sees this — it just ensures Render is warm before
- * they finish filling in the form and click submit.
- * Does nothing if BASE_URL is not set (local dev without backend).
- */
-async function pingServerInBackground() {
-  if (!BASE_URL) return
-
-  try {
-    await fetch(`${BASE_URL}/api/v1/health`, {
-      signal: AbortSignal.timeout(60_000),
-    })
-    console.log('[EntryForm] ✓ Server warm — form is ready')
-  } catch (err) {
-    // Silent failure — the form still renders and the submit will retry anyway
-    console.warn('[EntryForm] Warm-up ping failed:', err.message)
-  }
+// ── UUID GENERATOR (mock only) ─────────────────────────────────────────────────
+function generateMockUUID() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
 }
 
+// ── FORM VALIDATION ────────────────────────────────────────────────────────────
+function validateForm(formData) {
+  const errors = {}
+  FORM_FIELDS.forEach((field) => {
+    if (!field.required) return
+    if (!formData[field.id] || formData[field.id].trim() === '') {
+      errors[field.id] = `${field.label} is required`
+    }
+  })
+  return errors
+}
 
-// ── HOOK ──────────────────────────────────────────────────────────────────────
+// ── SLEEP HELPER ───────────────────────────────────────────────────────────────
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
+// ── MAIN HOOK ──────────────────────────────────────────────────────────────────
 export function useCustomerForm() {
-  const [formData, setFormData]     = useState(INITIAL_FORM_STATE)
-  const [status, setStatus]         = useState('idle')   // idle | submitting | success | error
-  const [responseData, setResponse] = useState(null)
-  const [errorMessage, setError]    = useState(null)
+  const [formData,     setFormData]     = useState(INITIAL_FORM_STATE)
+  const [errors,       setErrors]       = useState({})
+  const [submitStatus, setSubmitStatus] = useState('idle')
+  const [successData,  setSuccessData]  = useState(null)
+  const [errorMessage, setErrorMessage] = useState('')
+
+  // Tracks the warmup state so the UI can show a hint
+  // 'idle'    — not started yet
+  // 'warming' — health check in progress (Render is waking up)
+  // 'ready'   — server responded, all clear
+  const [serverStatus, setServerStatus] = useState('idle')
 
 
-  // FIX: warm-up ping fires as soon as the form component mounts.
-  // By the time a user reads the form, fills 7 fields, and clicks submit,
-  // Render has had 20–60 seconds to wake up — more than enough.
+  // ── WARMUP ON MOUNT ─────────────────────────────────────────────────────────
+  // Fire a silent GET /api/v1/health the moment this hook is created.
+  // This wakes Render before the user submits.
+  // No error shown to user if it fails — we handle retries in handleSubmit.
   useEffect(() => {
-    pingServerInBackground()
-  }, [])  // empty deps: runs once on mount
+    if (MOCK_MODE) return   // no warmup needed in mock mode
 
+    const BASE_URL = import.meta.env.VITE_API_URL || ''
 
-  const handleChange = useCallback((field, value) => {
-    setFormData(prev => ({ ...prev, [field]: value }))
-  }, [])
+    async function warmUp() {
+      setServerStatus('warming')
+      console.log('[Warmup] Pinging Render to prevent cold start...')
 
-
-  /**
-   * Submits the registration form with automatic retry on failure.
-   * @param {number} attempt - current attempt number (0 = first try)
-   */
-  const submitAttempt = useCallback(async (data, attempt = 0) => {
-    const res = await fetch(`${BASE_URL}/api/v1/customers/register`, {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify(data),
-      // 30s timeout per attempt — enough for a slow server but not forever
-      signal:  AbortSignal.timeout(30_000),
-    })
-
-    if (!res.ok) {
-      const errorBody = await res.json().catch(() => ({}))
-      throw new Error(errorBody.message || errorBody.detail || `HTTP ${res.status}`)
-    }
-
-    const body = await res.json()
-    // Unwrap the standard { success, data, message } envelope
-    return body.data ?? body
-  }, [])
-
-
-  const handleSubmit = useCallback(async () => {
-    // Validate all required fields before submitting
-    const missing = FORM_FIELDS
-      .filter(f => f.required && !formData[f.id])
-      .map(f => f.label)
-
-    if (missing.length > 0) {
-      setError(`Please fill in: ${missing.join(', ')}`)
-      setStatus('error')
-      return
-    }
-
-    setStatus('submitting')
-    setError(null)
-
-    let lastError = null
-
-    for (let attempt = 0; attempt <= MAX_SUBMIT_RETRIES; attempt++) {
       try {
-        // Wait before retry (not before the first attempt)
-        if (attempt > 0) {
-          console.log(`[EntryForm] Retrying submission (attempt ${attempt + 1})...`)
-          await new Promise(resolve => setTimeout(resolve, SUBMIT_RETRY_DELAY_MS))
+        const res = await fetch(`${BASE_URL}/api/v1/health`, {
+          method: 'GET',
+          // No timeout — we just want to wake Render, not block the UI
+        })
+        if (res.ok) {
+          setServerStatus('ready')
+          console.log('[Warmup] Server is awake ✓')
+        } else {
+          // Server responded but not 200 — still awake enough
+          setServerStatus('ready')
+          console.log('[Warmup] Server responded with', res.status)
         }
-
-        const data = await submitAttempt(formData, attempt)
-        setResponse(data)
-        setStatus('success')
-
-        // Auto-reset form after AUTO_RESET_DELAY_MS
-        setTimeout(() => {
-          setFormData(INITIAL_FORM_STATE)
-          setResponse(null)
-          setStatus('idle')
-        }, AUTO_RESET_DELAY_MS)
-
-        return  // success — stop retry loop
-
       } catch (err) {
-        lastError = err
-        console.warn(`[EntryForm] Attempt ${attempt + 1} failed:`, err.message)
+        // Warmup failed — Render might still be starting up
+        // handleSubmit will retry if needed
+        setServerStatus('idle')
+        console.warn('[Warmup] Server not yet reachable — will retry on submit:', err.message)
       }
     }
 
-    // All attempts exhausted
-    setError(
-      lastError?.message?.includes('timeout')
-        ? 'Server is starting up — please try again in a moment.'
-        : (lastError?.message || 'Registration failed. Please try again.')
-    )
-    setStatus('error')
+    warmUp()
+  }, [])  // runs once on mount
 
-  }, [formData, submitAttempt])
+
+  // ── handleChange ─────────────────────────────────────────────────────────────
+  const handleChange = useCallback((fieldId, value) => {
+    setFormData(prev => ({ ...prev, [fieldId]: value }))
+    setErrors(prev => {
+      if (!prev[fieldId]) return prev
+      const next = { ...prev }
+      delete next[fieldId]
+      return next
+    })
+  }, [])
+
+
+  // ── handleSubmit ──────────────────────────────────────────────────────────────
+  const handleSubmit = useCallback(async () => {
+
+    // Step 1: client-side validation
+    const validationErrors = validateForm(formData)
+    if (Object.keys(validationErrors).length > 0) {
+      setErrors(validationErrors)
+      return
+    }
+
+    setErrors({})
+    setErrorMessage('')
+    setSubmitStatus('loading')
+
+    try {
+      let responseData
+
+      if (MOCK_MODE) {
+        await sleep(MOCK_DELAY_MS)
+        responseData = {
+          customer_id:          generateMockUUID(),
+          registered_at:        new Date().toISOString(),
+          days_until_scoreable: 30,
+          status:               'created',
+          initial_features:     {},
+        }
+
+      } else {
+        // ── REAL API with cold-start retry ──────────────────────────────────
+        const BASE_URL = import.meta.env.VITE_API_URL || ''
+
+        const payload = {
+          ...formData,
+          city_tier: formData.city_tier ? parseInt(formData.city_tier, 10) : null,
+        }
+
+        let lastError = null
+
+        for (let attempt = 1; attempt <= MAX_SUBMIT_RETRIES; attempt++) {
+
+          // Show the user what is happening on retry attempts
+          if (attempt > 1) {
+            setErrorMessage(
+              `Waking up server... attempt ${attempt} of ${MAX_SUBMIT_RETRIES}. ` +
+              `Render free tier needs up to 50 seconds to start. Please wait.`
+            )
+            // Wait before retrying so Render has time to wake up
+            await sleep(WARMUP_RETRY_DELAY_MS)
+          }
+
+          try {
+            const response = await fetch(`${BASE_URL}/api/v1/customers/register`, {
+              method:  'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body:    JSON.stringify(payload),
+            })
+
+            if (!response.ok) {
+              // Server responded but with an error (4xx / 5xx)
+              // This is NOT a cold start issue — do not retry
+              const errorBody = await response.json().catch(() => ({}))
+              throw new Error(
+                errorBody.detail ??
+                errorBody.message ??
+                `Registration failed (HTTP ${response.status})`
+              )
+            }
+
+            // ── Success — unwrap the APIResponse envelope ──────────────────
+            // FastAPI returns: { "success": true, "data": {...}, "message": "..." }
+            // SuccessCard needs body.data, not the wrapper
+            const body = await response.json()
+            responseData = body.data ?? body
+            lastError = null
+            break  // success — exit the retry loop
+
+          } catch (fetchErr) {
+            lastError = fetchErr
+
+            // "Failed to fetch" = network error (cold start, timeout, offline)
+            // Retry for these. For actual HTTP errors (4xx/5xx), we already threw above.
+            const isColdStart = (
+              fetchErr.message === 'Failed to fetch' ||
+              fetchErr.message?.includes('fetch') ||
+              fetchErr.name === 'TypeError'
+            )
+
+            if (isColdStart && attempt < MAX_SUBMIT_RETRIES) {
+              console.warn(
+                `[Submit] Attempt ${attempt} failed (likely cold start): ${fetchErr.message}. ` +
+                `Retrying in ${WARMUP_RETRY_DELAY_MS / 1000}s...`
+              )
+              // Loop continues to next attempt
+            } else {
+              // Not a network error, or we've run out of retries
+              throw fetchErr
+            }
+          }
+        }
+
+        // If we exhausted all retries, lastError is still set
+        if (lastError) {
+          throw lastError
+        }
+      }
+
+      // ── Registration succeeded ──────────────────────────────────────────────
+      setErrorMessage('')   // clear any "Waking up..." message
+      setSuccessData(responseData)
+      setSubmitStatus('success')
+      setServerStatus('ready')
+
+      // Auto-reset after 5 seconds
+      setTimeout(() => {
+        resetForm()
+      }, SUCCESS_AUTO_RESET_MS)
+
+    } catch (err) {
+      setSubmitStatus('error')
+
+      // User-friendly message for cold start that exhausted all retries
+      if (
+        err.message === 'Failed to fetch' ||
+        err.message?.includes('fetch')
+      ) {
+        setErrorMessage(
+          'Server is still starting up. Wait 30 seconds then try again. ' +
+          'Render free tier can take up to 50 seconds to wake.'
+        )
+      } else {
+        setErrorMessage(err.message ?? 'Registration failed. Please try again.')
+      }
+    }
+  }, [formData])
+
+
+  // ── resetForm ─────────────────────────────────────────────────────────────────
+  const resetForm = useCallback(() => {
+    setFormData(INITIAL_FORM_STATE)
+    setErrors({})
+    setSubmitStatus('idle')
+    setSuccessData(null)
+    setErrorMessage('')
+    // Keep serverStatus as 'ready' — server is still awake
+  }, [])
 
 
   return {
     formData,
-    status,
-    responseData,
+    errors,
+    submitStatus,
+    successData,
     errorMessage,
+    serverStatus,   // 'idle' | 'warming' | 'ready'
     handleChange,
     handleSubmit,
-    isSubmitting: status === 'submitting',
-    isSuccess:    status === 'success',
-    isError:      status === 'error',
+    resetForm,
   }
 }
